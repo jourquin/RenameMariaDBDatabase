@@ -1,17 +1,19 @@
-# MariaDB Database Rename Scripts
+# MariaDB / MySQL Database Rename Scripts
 
-This repository contains two scripts to safely "rename" a MariaDB database:
+This repository contains two scripts to safely "rename" a MariaDB or MySQL database:
 
 - `rename-mariadb-database.sh` for Linux, macOS, and other Unix-like systems
 - `rename-mariadb-database.ps1` for Windows PowerShell
 
-MariaDB does not provide a direct `RENAME DATABASE` command. These scripts therefore use a dump-and-restore workflow:
+MariaDB and MySQL do not provide a direct `RENAME DATABASE` command. These scripts therefore use a dump-and-restore workflow:
 
 1. Create a new database.
 2. Dump the existing database.
 3. Import the dump into the new database.
-4. Show a table-count comparison.
-5. Let you verify the result before deleting the original database.
+4. Optionally copy database, table, and column-level grants from the old database to the new one.
+5. Show a table-count comparison.
+6. Optionally delete the generated SQL files.
+7. Let you verify the result before deleting the original database.
 
 ## Repository files
 
@@ -20,19 +22,20 @@ MariaDB does not provide a direct `RENAME DATABASE` command. These scripts there
 | `rename-mariadb-database.sh` | Linux, macOS, Unix-like systems | Bash script |
 | `rename-mariadb-database.ps1` | Windows | PowerShell script |
 
-
 ## What the scripts do
 
 Both scripts:
 
-- use the same command-line options;
-- ask for the MariaDB password only once;
+- use the same database-renaming command-line options;
+- ask for the database password only once;
 - avoid passing the password directly on the command line;
-- create a temporary MariaDB option file;
+- create a temporary MariaDB/MySQL option file;
 - create the target database;
 - dump the source database;
-- include tables, data, routines, triggers, and events;
+- include tables, data, routines, triggers, and events in the dump;
 - import the dump into the target database;
+- optionally copy database, table, and column-level grants to the target database;
+- optionally delete the generated dump and grants SQL files;
 - show a table-count comparison between the source and target databases;
 - keep the original database unless deletion is explicitly enabled.
 
@@ -42,48 +45,52 @@ Both scripts:
 
 You need:
 
-- access to a MariaDB server;
-- MariaDB client tools installed;
-- a MariaDB user with privileges to:
+- access to a MariaDB or MySQL server;
+- MariaDB or MySQL client tools installed;
+- a database user with privileges to:
   - create databases;
   - dump the source database;
   - import data into the target database;
-  - read routines, triggers, and events;
+  - read routines, triggers, events, and privilege metadata;
+  - grant privileges on the target database if `-CopyGrants` is used;
   - optionally drop the old database.
-
-On some systems, the dump tool may be called `mysqldump` instead of `mariadb-dump`.
 
 ### Bash requirements
 
 For `rename-mariadb-database.sh`:
 
 - Bash
-- `mariadb`
-- `mariadb-dump`, or `mysqldump` as a fallback
+- `mariadb` or `mysql`
+- `mariadb-dump` or `mysqldump`
 
 ### PowerShell requirements
 
 For `rename-mariadb-database.ps1`:
 
 - PowerShell
-- `mariadb.exe`
-- `mariadb-dump.exe`, or `mysqldump.exe` as a fallback
+- `mariadb.exe` or `mysql.exe`
+- `mariadb-dump.exe` or `mysqldump.exe`
 
 ## Command-line options
 
-Both scripts support the same database-renaming options.
+Both scripts support the same main options.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-OldDb` | Yes | | Source database name |
 | `-NewDb` | Yes | | Target database name |
-| `-User` | No | `root` | MariaDB user |
-| `-Host` | No | `localhost` | MariaDB host |
-| `-Port` | No | `3306` | MariaDB port |
+| `-User` | No | `root` | Database user |
+| `-Host` | No | `localhost` | Database host |
+| `-Port` | No | `3306` | Database port |
 | `-DumpFile` | No | Timestamped SQL file | Path of the SQL dump file to create |
-| `-MariaDbExe` | No | `mariadb` / `mariadb.exe` | Path to the MariaDB client |
+| `-CopyGrants` | No | Disabled | Generate and apply equivalent database, table, and column-level grants for the target database |
+| `-GrantsFile` | No | Timestamped SQL file | Path of the generated grants SQL file when `-CopyGrants` is used |
+| `-DeleteSqlFiles` | No | Disabled | Delete the dump file and generated grants file after a successful run |
+| `-ClientExe` | No | Auto-detected | Path to `mariadb`, `mysql`, `mariadb.exe`, or `mysql.exe` |
 | `-DumpExe` | No | Auto-detected | Path to `mariadb-dump`, `mariadb-dump.exe`, `mysqldump`, or `mysqldump.exe` |
 | `-DropOldDatabase` | No | Disabled | Drops the source database after import and verification query |
+
+The Bash script also supports `-Help`, `--help`, and `-h`.
 
 ## Using the Bash script
 
@@ -117,15 +124,49 @@ With an explicit dump file:
 ./rename-mariadb-database.sh -OldDb old_database_name -NewDb new_database_name -User root -DumpFile /tmp/old_database_name.sql
 ```
 
-With explicit MariaDB client paths:
+Copy grants from the old database to the new database:
+
+```bash
+./rename-mariadb-database.sh -OldDb old_database_name -NewDb new_database_name -User root -CopyGrants
+```
+
+Copy grants and keep the generated grants SQL file at a specific path:
 
 ```bash
 ./rename-mariadb-database.sh \
   -OldDb old_database_name \
   -NewDb new_database_name \
   -User root \
-  -MariaDbExe /usr/bin/mariadb \
+  -CopyGrants \
+  -GrantsFile /tmp/copied-grants.sql
+```
+
+Delete generated SQL files after a successful run:
+
+```bash
+./rename-mariadb-database.sh -OldDb old_database_name -NewDb new_database_name -User root -DeleteSqlFiles
+```
+
+Use MariaDB client tools explicitly:
+
+```bash
+./rename-mariadb-database.sh \
+  -OldDb old_database_name \
+  -NewDb new_database_name \
+  -User root \
+  -ClientExe /usr/bin/mariadb \
   -DumpExe /usr/bin/mariadb-dump
+```
+
+Use MySQL client tools explicitly:
+
+```bash
+./rename-mariadb-database.sh \
+  -OldDb old_database_name \
+  -NewDb new_database_name \
+  -User root \
+  -ClientExe /usr/bin/mysql \
+  -DumpExe /usr/bin/mysqldump
 ```
 
 Delete the old database after the import and verification query:
@@ -154,15 +195,49 @@ With an explicit dump file:
 .\rename-mariadb-database.ps1 -OldDb old_database_name -NewDb new_database_name -User root -DumpFile "C:\Temp\old_database_name.sql"
 ```
 
-With explicit MariaDB client paths:
+Copy grants from the old database to the new database:
+
+```powershell
+.\rename-mariadb-database.ps1 -OldDb old_database_name -NewDb new_database_name -User root -CopyGrants
+```
+
+Copy grants and keep the generated grants SQL file at a specific path:
 
 ```powershell
 .\rename-mariadb-database.ps1 `
   -OldDb old_database_name `
   -NewDb new_database_name `
   -User root `
-  -MariaDbExe "C:\Program Files\MariaDB 11.4\bin\mariadb.exe" `
+  -CopyGrants `
+  -GrantsFile "C:\Temp\copied-grants.sql"
+```
+
+Delete generated SQL files after a successful run:
+
+```powershell
+.\rename-mariadb-database.ps1 -OldDb old_database_name -NewDb new_database_name -User root -DeleteSqlFiles
+```
+
+Use MariaDB client tools explicitly:
+
+```powershell
+.\rename-mariadb-database.ps1 `
+  -OldDb old_database_name `
+  -NewDb new_database_name `
+  -User root `
+  -ClientExe "C:\Program Files\MariaDB 11.4\bin\mariadb.exe" `
   -DumpExe "C:\Program Files\MariaDB 11.4\bin\mariadb-dump.exe"
+```
+
+Use MySQL client tools explicitly:
+
+```powershell
+.\rename-mariadb-database.ps1 `
+  -OldDb old_database_name `
+  -NewDb new_database_name `
+  -User root `
+  -ClientExe "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe" `
+  -DumpExe "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysqldump.exe"
 ```
 
 Delete the old database after the import and verification query:
@@ -180,6 +255,60 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
 Then run the script again.
+
+## MySQL compatibility
+
+The scripts now support both MariaDB and MySQL.
+
+The relevant changes are:
+
+- `-ClientExe` replaces the previous MariaDB-specific client option;
+- the scripts auto-detect `mariadb` first, then `mysql`;
+- the dump tool auto-detection checks `mariadb-dump` first, then `mysqldump`;
+- the temporary option file uses the `[client]` group, which is understood by both MariaDB and MySQL client tools;
+- the dump command uses options supported by both MariaDB and MySQL dump tools: `--single-transaction`, `--routines`, `--triggers`, and `--events`;
+- grant copying uses `information_schema.SCHEMA_PRIVILEGES`, `information_schema.TABLE_PRIVILEGES`, and `information_schema.COLUMN_PRIVILEGES`.
+
+Use `-ClientExe` to select either a MariaDB or MySQL client explicitly.
+
+## Grant-copying behavior
+
+When `-CopyGrants` is used, the scripts generate a SQL file containing `GRANT` statements for the target database and then apply it.
+
+The generated grants are based on:
+
+- `information_schema.SCHEMA_PRIVILEGES`;
+- `information_schema.TABLE_PRIVILEGES`;
+- `information_schema.COLUMN_PRIVILEGES`.
+
+This covers database-level, table-level, and column-level privileges that explicitly refer to the source database.
+
+It does not copy:
+
+- global privileges;
+- roles themselves;
+- user accounts themselves;
+- privileges unrelated to the source database;
+- privileges that are not exposed through the three `information_schema` privilege views listed above.
+
+The generated grants file is kept on disk by default so that you can inspect what was applied. Use `-DeleteSqlFiles` to remove it automatically after a successful run.
+
+## SQL file deletion behavior
+
+When `-DeleteSqlFiles` is used, the scripts delete generated SQL files only after the complete operation succeeds.
+
+The dump file is deleted after:
+
+- the new database is created;
+- the dump is created;
+- the dump is imported;
+- table counts are shown;
+- grants are copied, if `-CopyGrants` is used;
+- the old database is dropped, if `-DropOldDatabase` is used.
+
+The grants file is deleted only if it was generated during the current run.
+
+If the script fails before the final cleanup step, the SQL files are kept.
 
 ## Important notes
 
@@ -200,20 +329,6 @@ Before deleting the original database, check at least:
 - triggers;
 - events;
 - user permissions.
-
-### Grants are not renamed automatically
-
-Database-specific grants for the old database are not automatically transferred to the new database.
-
-For example, a grant on `old_database_name.*` does not automatically become a grant on `new_database_name.*`.
-
-Check grants after migration:
-
-```sql
-SHOW GRANTS FOR 'user'@'host';
-```
-
-Then recreate the required grants for the new database if needed.
 
 ### Character set and collation
 

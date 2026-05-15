@@ -1,39 +1,54 @@
-\
 <#
 .SYNOPSIS
-    Safely "renames" a MariaDB database on Windows by dumping and restoring it.
+    Safely "renames" a MariaDB or MySQL database on Windows by dumping and restoring it.
 
 .DESCRIPTION
-    MariaDB does not support a direct RENAME DATABASE command.
+    MariaDB and MySQL do not support a direct RENAME DATABASE command.
 
     This PowerShell script:
-      1. Prompts once for the MariaDB password.
-      2. Creates a temporary MariaDB option file.
+      1. Prompts once for the database password.
+      2. Creates a temporary client option file.
       3. Creates the new database.
       4. Dumps the old database, including routines, triggers, and events.
       5. Imports the dump into the new database.
       6. Shows a simple table-count comparison.
-      7. Leaves the old database untouched unless you explicitly use -DropOldDatabase.
+      7. Optionally copies database, table, and column-level grants.
+      8. Optionally deletes generated SQL files.
+      9. Leaves the old database untouched unless you explicitly use -DropOldDatabase.
 
 .REQUIREMENTS
     - PowerShell
-    - mariadb.exe
-    - mariadb-dump.exe, or mysqldump.exe as a fallback
-    - The MariaDB client tools must be in PATH, unless you pass -MariaDbExe and -DumpExe manually.
+    - mariadb.exe or mysql.exe
+    - mariadb-dump.exe or mysqldump.exe
+    - The client tools must be in PATH, unless you pass -ClientExe and -DumpExe manually.
 
 .EXAMPLE
-    .\Rename-MariaDbDatabase.ps1 -OldDb oldname -NewDb newname -User root
+    .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root
 
 .EXAMPLE
-    .\Rename-MariaDbDatabase.ps1 -OldDb oldname -NewDb newname -User root -Host localhost -Port 3306
+    .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root -CopyGrants
 
 .EXAMPLE
-    .\Rename-MariaDbDatabase.ps1 `
+    .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root -DeleteSqlFiles
+
+.EXAMPLE
+    .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root -Host localhost -Port 3306
+
+.EXAMPLE
+    .\rename-mariadb-database.ps1 `
       -OldDb oldname `
       -NewDb newname `
       -User root `
-      -MariaDbExe "C:\Program Files\MariaDB 11.4\bin\mariadb.exe" `
-      -DumpExe "C:\Program Files\MariaDB 11.4\bin\mariadb-dump.exe"
+      -CopyGrants `
+      -GrantsFile "C:\Temp\oldname-to-newname-grants.sql"
+
+.EXAMPLE
+    .\rename-mariadb-database.ps1 `
+      -OldDb oldname `
+      -NewDb newname `
+      -User root `
+      -ClientExe "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe" `
+      -DumpExe "C:\Program Files\MySQL\MySQL Server 8.4\bin\mysqldump.exe"
 
 .NOTES
     For production databases, stop application writes before running this script.
@@ -55,9 +70,15 @@ param(
 
     [string]$DumpFile = "",
 
-    [string]$MariaDbExe = "mariadb.exe",
+    [string]$GrantsFile = "",
+
+    [string]$ClientExe = "",
 
     [string]$DumpExe = "",
+
+    [switch]$CopyGrants,
+
+    [switch]$DeleteSqlFiles,
 
     [switch]$DropOldDatabase
 )
@@ -72,6 +93,10 @@ function Resolve-Executable {
     )
 
     foreach ($candidate in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
         $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
         if ($cmd) {
             return $cmd.Source
@@ -91,8 +116,18 @@ function Quote-Identifier {
         [string]$Name
     )
 
-    # MariaDB identifiers are quoted with backticks. Embedded backticks are doubled.
+    # MariaDB/MySQL identifiers are quoted with backticks. Embedded backticks are doubled.
     return '`' + ($Name -replace '`', '``') + '`'
+}
+
+function Quote-SqlString {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
+
+    # SQL string literals are quoted with single quotes. Embedded single quotes are doubled.
+    return "'" + ($Value -replace "'", "''") + "'"
 }
 
 function Invoke-Native {
@@ -164,9 +199,6 @@ function Invoke-NativeRedirectInput {
     [void]$process.Start()
 
     try {
-        # SQL dump files are text files. This streams the file to mariadb.exe.
-        # For typical MariaDB dumps this avoids PowerShell command-line password exposure
-        # while preserving a simple Windows-native workflow.
         $reader = [System.IO.File]::OpenText($InputFile)
         try {
             while (($line = $reader.ReadLine()) -ne $null) {
@@ -204,7 +236,45 @@ function Protect-TempFileBestEffort {
     }
 }
 
-$MariaDbExe = Resolve-Executable @($MariaDbExe)
+function Test-FileHasContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+
+    $content = Get-Content -Path $Path -Raw
+    return -not [string]::IsNullOrWhiteSpace($content)
+}
+
+function Remove-GeneratedFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    if (Test-Path $Path) {
+        Write-Host "Deleting $Description '$Path'..."
+        Remove-Item -LiteralPath $Path -Force
+        Write-Host "$Description deleted."
+    }
+    else {
+        Write-Host "$Description '$Path' was not found; nothing to delete."
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($ClientExe)) {
+    $ClientExe = Resolve-Executable @("mariadb.exe", "mysql.exe")
+}
+else {
+    $ClientExe = Resolve-Executable @($ClientExe)
+}
 
 if ([string]::IsNullOrWhiteSpace($DumpExe)) {
     $DumpExe = Resolve-Executable @("mariadb-dump.exe", "mysqldump.exe")
@@ -213,15 +283,120 @@ else {
     $DumpExe = Resolve-Executable @($DumpExe)
 }
 
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+
 if ([string]::IsNullOrWhiteSpace($DumpFile)) {
-    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $DumpFile = Join-Path (Get-Location) "$OldDb-$timestamp.sql"
+}
+
+if ([string]::IsNullOrWhiteSpace($GrantsFile)) {
+    $GrantsFile = Join-Path (Get-Location) "$OldDb-to-$NewDb-grants-$timestamp.sql"
+}
+elseif (-not $CopyGrants) {
+    Write-Warning "-GrantsFile was provided but -CopyGrants is not enabled; the grants file will not be generated."
 }
 
 $OldDbQuoted = Quote-Identifier $OldDb
 $NewDbQuoted = Quote-Identifier $NewDb
+$OldDbLiteral = Quote-SqlString $OldDb
+$NewDbLiteral = Quote-SqlString $NewDb
+$NewDbIdentifierLiteral = Quote-SqlString $NewDbQuoted
+$GrantsFileCreated = $false
 
-$securePassword = Read-Host "MariaDB password for $User" -AsSecureString
+$sqlTableCountTemplate = @'
+SELECT table_schema, COUNT(*) AS tables
+FROM information_schema.tables
+WHERE table_schema IN (__OLD_DB_LITERAL__, __NEW_DB_LITERAL__)
+GROUP BY table_schema;
+'@
+
+$sqlTableCount = $sqlTableCountTemplate.
+    Replace("__OLD_DB_LITERAL__", $OldDbLiteral).
+    Replace("__NEW_DB_LITERAL__", $NewDbLiteral)
+
+$sqlCopyGrantsTemplate = @'
+SET SESSION group_concat_max_len = 1048576;
+
+SELECT grant_statement
+FROM (
+  SELECT
+    1 AS sort_order,
+    GRANTEE AS grantee_sort,
+    '' AS object_sort,
+    '' AS privilege_sort,
+    IS_GRANTABLE AS grantable_sort,
+    CONCAT(
+      'GRANT ',
+      GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE SEPARATOR ', '),
+      ' ON ',
+      __NEW_DB_IDENTIFIER_LITERAL__,
+      '.* TO ',
+      GRANTEE,
+      IF(IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', ''),
+      ';'
+    ) AS grant_statement
+  FROM information_schema.SCHEMA_PRIVILEGES
+  WHERE TABLE_SCHEMA = __OLD_DB_LITERAL__
+  GROUP BY GRANTEE, IS_GRANTABLE
+
+  UNION ALL
+
+  SELECT
+    2 AS sort_order,
+    GRANTEE AS grantee_sort,
+    TABLE_NAME AS object_sort,
+    '' AS privilege_sort,
+    IS_GRANTABLE AS grantable_sort,
+    CONCAT(
+      'GRANT ',
+      GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE SEPARATOR ', '),
+      ' ON ',
+      __NEW_DB_IDENTIFIER_LITERAL__,
+      '.`',
+      REPLACE(TABLE_NAME, '`', '``'),
+      '` TO ',
+      GRANTEE,
+      IF(IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', ''),
+      ';'
+    ) AS grant_statement
+  FROM information_schema.TABLE_PRIVILEGES
+  WHERE TABLE_SCHEMA = __OLD_DB_LITERAL__
+  GROUP BY GRANTEE, TABLE_NAME, IS_GRANTABLE
+
+  UNION ALL
+
+  SELECT
+    3 AS sort_order,
+    GRANTEE AS grantee_sort,
+    TABLE_NAME AS object_sort,
+    PRIVILEGE_TYPE AS privilege_sort,
+    IS_GRANTABLE AS grantable_sort,
+    CONCAT(
+      'GRANT ',
+      PRIVILEGE_TYPE,
+      ' (',
+      GROUP_CONCAT(CONCAT('`', REPLACE(COLUMN_NAME, '`', '``'), '`') ORDER BY COLUMN_NAME SEPARATOR ', '),
+      ') ON ',
+      __NEW_DB_IDENTIFIER_LITERAL__,
+      '.`',
+      REPLACE(TABLE_NAME, '`', '``'),
+      '` TO ',
+      GRANTEE,
+      IF(IS_GRANTABLE = 'YES', ' WITH GRANT OPTION', ''),
+      ';'
+    ) AS grant_statement
+  FROM information_schema.COLUMN_PRIVILEGES
+  WHERE TABLE_SCHEMA = __OLD_DB_LITERAL__
+  GROUP BY GRANTEE, TABLE_NAME, PRIVILEGE_TYPE, IS_GRANTABLE
+) AS generated_grants
+ORDER BY sort_order, grantee_sort, object_sort, privilege_sort, grantable_sort;
+'@
+
+$sqlCopyGrants = $sqlCopyGrantsTemplate.
+    Replace("__OLD_DB_LITERAL__", $OldDbLiteral).
+    Replace("__NEW_DB_IDENTIFIER_LITERAL__", $NewDbIdentifierLiteral)
+
+$securePassword = Read-Host "Database password for $User" -AsSecureString
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
 $plainPassword = $null
 $defaultsFile = $null
@@ -244,7 +419,7 @@ port=$Port
     $defaultsArg = "--defaults-extra-file=$defaultsFile"
 
     Write-Host "Creating database '$NewDb'..."
-    Invoke-Native -Exe $MariaDbExe -Arguments @(
+    Invoke-Native -Exe $ClientExe -Arguments @(
         $defaultsArg,
         "-e",
         "CREATE DATABASE $NewDbQuoted;"
@@ -261,21 +436,46 @@ port=$Port
     ) -OutputFile $DumpFile
 
     Write-Host "Importing '$DumpFile' into '$NewDb'..."
-    Invoke-NativeRedirectInput -Exe $MariaDbExe -Arguments @(
+    Invoke-NativeRedirectInput -Exe $ClientExe -Arguments @(
         $defaultsArg,
         $NewDb
     ) -InputFile $DumpFile
 
     Write-Host "Comparing table counts..."
-    Invoke-Native -Exe $MariaDbExe -Arguments @(
+    Invoke-Native -Exe $ClientExe -Arguments @(
         $defaultsArg,
         "-e",
-        "SELECT table_schema, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema IN ('$OldDb', '$NewDb') GROUP BY table_schema;"
+        $sqlTableCount
     )
+
+    if ($CopyGrants) {
+        Write-Host "Generating grants file '$GrantsFile'..."
+        Invoke-NativeRedirectOutput -Exe $ClientExe -Arguments @(
+            $defaultsArg,
+            "--batch",
+            "--raw",
+            "--skip-column-names",
+            "-e",
+            $sqlCopyGrants
+        ) -OutputFile $GrantsFile
+
+        $GrantsFileCreated = $true
+
+        if (Test-FileHasContent -Path $GrantsFile) {
+            Write-Host "Applying copied grants from '$GrantsFile'..."
+            Invoke-NativeRedirectInput -Exe $ClientExe -Arguments @(
+                $defaultsArg
+            ) -InputFile $GrantsFile
+            Write-Host "Copied grants applied."
+        }
+        else {
+            Write-Host "No database, table, or column-level grants found for '$OldDb'."
+        }
+    }
 
     if ($DropOldDatabase) {
         Write-Warning "Dropping old database '$OldDb'..."
-        Invoke-Native -Exe $MariaDbExe -Arguments @(
+        Invoke-Native -Exe $ClientExe -Arguments @(
             $defaultsArg,
             "-e",
             "DROP DATABASE $OldDbQuoted;"
@@ -286,6 +486,14 @@ port=$Port
         Write-Host ""
         Write-Host "Import completed. The old database '$OldDb' was NOT deleted."
         Write-Host "After verification, you can rerun with -DropOldDatabase or drop it manually."
+    }
+
+    if ($DeleteSqlFiles) {
+        Remove-GeneratedFile -Path $DumpFile -Description "dump file"
+
+        if ($GrantsFileCreated) {
+            Remove-GeneratedFile -Path $GrantsFile -Description "grants file"
+        }
     }
 
     Write-Host ""
