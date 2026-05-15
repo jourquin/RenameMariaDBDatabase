@@ -64,7 +64,8 @@ param(
 
     [string]$User = "root",
 
-    [string]$Host = "localhost",
+    [Alias("Host")]
+    [string]$DbHost = "localhost",
 
     [int]$Port = 3306,
 
@@ -141,7 +142,7 @@ function Invoke-Native {
 
     & $Exe @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE: $Exe $($Arguments -join ' ')"
+        throw "Command failed with exit code ${LASTEXITCODE}: $Exe $($Arguments -join ' ')"
     }
 }
 
@@ -182,44 +183,71 @@ function Invoke-NativeRedirectInput {
         [string]$InputFile
     )
 
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = $Exe
-    foreach ($arg in $Arguments) {
-        [void]$processInfo.ArgumentList.Add($arg)
+    # Windows PowerShell 5.1 does not expose ProcessStartInfo.ArgumentList.
+    # Start-Process with -RedirectStandardInput is compatible with Windows PowerShell 5.1
+    # and avoids loading large SQL dump files into memory.
+    $process = Start-Process `
+        -FilePath $Exe `
+        -ArgumentList $Arguments `
+        -NoNewWindow `
+        -Wait `
+        -PassThru `
+        -RedirectStandardInput $InputFile
+
+    if ($process.ExitCode -ne 0) {
+        throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')"
     }
+}
 
-    $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardInput = $true
-    $processInfo.RedirectStandardOutput = $false
-    $processInfo.RedirectStandardError = $false
+function Invoke-NativeRedirectInputOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Exe,
 
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $processInfo
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
 
-    [void]$process.Start()
+        [Parameter(Mandatory = $true)]
+        [string]$InputFile,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    $errorFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $reader = [System.IO.File]::OpenText($InputFile)
-        try {
-            while (($line = $reader.ReadLine()) -ne $null) {
-                $process.StandardInput.WriteLine($line)
-            }
-        }
-        finally {
-            $reader.Close()
-        }
-
-        $process.StandardInput.Close()
-        $process.WaitForExit()
+        $process = Start-Process `
+            -FilePath $Exe `
+            -ArgumentList $Arguments `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardInput $InputFile `
+            -RedirectStandardOutput $OutputFile `
+            -RedirectStandardError $errorFile
 
         if ($process.ExitCode -ne 0) {
-            throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')"
+            $errorText = ""
+            if (Test-Path $errorFile) {
+                $errorText = Get-Content -Path $errorFile -Raw
+            }
+
+            if ([string]::IsNullOrWhiteSpace($errorText)) {
+                throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')"
+            }
+            else {
+                throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')`n$errorText"
+            }
         }
     }
     finally {
-        $process.Dispose()
+        if (Test-Path $errorFile) {
+            Remove-Item -LiteralPath $errorFile -Force
+        }
     }
 }
+
 
 function Protect-TempFileBestEffort {
     param(
@@ -410,7 +438,7 @@ try {
 [client]
 user=$User
 password=$plainPassword
-host=$Host
+host=$DbHost
 port=$Port
 "@ | Set-Content -Path $defaultsFile -Encoding ASCII -NoNewline
 
@@ -450,14 +478,23 @@ port=$Port
 
     if ($CopyGrants) {
         Write-Host "Generating grants file '$GrantsFile'..."
-        Invoke-NativeRedirectOutput -Exe $ClientExe -Arguments @(
-            $defaultsArg,
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            "-e",
-            $sqlCopyGrants
-        ) -OutputFile $GrantsFile
+
+        $grantQueryFile = [System.IO.Path]::GetTempFileName()
+        try {
+            Set-Content -Path $grantQueryFile -Value $sqlCopyGrants -Encoding ASCII
+
+            Invoke-NativeRedirectInputOutput -Exe $ClientExe -Arguments @(
+                $defaultsArg,
+                "--batch",
+                "--raw",
+                "--skip-column-names"
+            ) -InputFile $grantQueryFile -OutputFile $GrantsFile
+        }
+        finally {
+            if (Test-Path $grantQueryFile) {
+                Remove-Item -LiteralPath $grantQueryFile -Force
+            }
+        }
 
         $GrantsFileCreated = $true
 
