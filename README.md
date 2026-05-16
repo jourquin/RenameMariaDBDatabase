@@ -9,11 +9,12 @@ MariaDB and MySQL do not provide a direct `RENAME DATABASE` command. These scrip
 
 1. Create a new database.
 2. Dump the existing database.
-3. Import the dump into the new database.
-4. Optionally copy database, table, and column-level grants from the old database to the new one.
-5. Show a table-count comparison.
-6. Optionally delete the generated SQL files.
-7. Let you verify the result before deleting the original database.
+3. Optionally store the dump as a gzip-compressed SQL file.
+4. Import the dump into the new database.
+5. Optionally copy database, table, and column-level grants from the old database to the new one.
+6. Show a table-count comparison.
+7. Optionally delete the generated SQL files.
+8. Let you verify the result before deleting the original database.
 
 ## Repository files
 
@@ -32,8 +33,9 @@ Both scripts:
 - create a temporary MariaDB/MySQL option file;
 - create the target database;
 - dump the source database;
+- optionally compress the dump as a `.sql.gz` file;
 - include tables, data, routines, triggers, and events in the dump;
-- import the dump into the target database;
+- import the dump into the target database, decompressing it automatically when needed;
 - optionally copy database, table, and column-level grants to the target database;
 - optionally delete the generated dump and grants SQL files;
 - show a table-count comparison between the source and target databases;
@@ -62,6 +64,7 @@ For `rename-mariadb-database.sh`:
 - Bash
 - `mariadb` or `mysql`
 - `mariadb-dump` or `mysqldump`
+- `gzip` when `-CompressDump` is used
 
 ### PowerShell requirements
 
@@ -71,9 +74,11 @@ For `rename-mariadb-database.ps1`:
 - `mariadb.exe` or `mysql.exe`
 - `mariadb-dump.exe` or `mysqldump.exe`
 
+The PowerShell script uses .NET's built-in gzip streams for compressed dumps, so it does not require an external `gzip.exe`.
+
 ## Command-line options
 
-Both scripts support the same main options.
+Both scripts support the same main options, except `-GzipExe`, which is Bash-only.
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -82,7 +87,9 @@ Both scripts support the same main options.
 | `-User` | No | `root` | Database user |
 | `-Host` | No | `localhost` | Database host |
 | `-Port` | No | `3306` | Database port |
-| `-DumpFile` | No | Timestamped SQL file | Path of the SQL dump file to create |
+| `-DumpFile` | No | Timestamped SQL file | Path of the SQL dump file to create. With `-CompressDump`, the default extension is `.sql.gz` |
+| `-CompressDump` | No | Disabled | Store the dump as a gzip-compressed SQL file and decompress it automatically during import |
+| `-GzipExe` | No | Auto-detected | Bash-only path to `gzip`, used when `-CompressDump` is enabled |
 | `-CopyGrants` | No | Disabled | Generate and apply equivalent database, table, and column-level grants for the target database |
 | `-GrantsFile` | No | Timestamped SQL file | Path of the generated grants SQL file when `-CopyGrants` is used |
 | `-DeleteSqlFiles` | No | Disabled | Delete the dump file and generated grants file after a successful run |
@@ -122,6 +129,34 @@ With an explicit dump file:
 
 ```bash
 ./rename-mariadb-database.sh -OldDb old_database_name -NewDb new_database_name -User root -DumpFile /tmp/old_database_name.sql
+```
+
+Create and import a compressed dump:
+
+```bash
+./rename-mariadb-database.sh -OldDb old_database_name -NewDb new_database_name -User root -CompressDump
+```
+
+Create a compressed dump with an explicit path:
+
+```bash
+./rename-mariadb-database.sh \
+  -OldDb old_database_name \
+  -NewDb new_database_name \
+  -User root \
+  -CompressDump \
+  -DumpFile /tmp/old_database_name.sql.gz
+```
+
+Use a specific `gzip` executable:
+
+```bash
+./rename-mariadb-database.sh \
+  -OldDb old_database_name \
+  -NewDb new_database_name \
+  -User root \
+  -CompressDump \
+  -GzipExe /usr/bin/gzip
 ```
 
 Copy grants from the old database to the new database:
@@ -195,6 +230,23 @@ With an explicit dump file:
 .\rename-mariadb-database.ps1 -OldDb old_database_name -NewDb new_database_name -User root -DumpFile "C:\Temp\old_database_name.sql"
 ```
 
+Create and import a compressed dump:
+
+```powershell
+.\rename-mariadb-database.ps1 -OldDb old_database_name -NewDb new_database_name -User root -CompressDump
+```
+
+Create a compressed dump with an explicit path:
+
+```powershell
+.\rename-mariadb-database.ps1 `
+  -OldDb old_database_name `
+  -NewDb new_database_name `
+  -User root `
+  -CompressDump `
+  -DumpFile "C:\Temp\old_database_name.sql.gz"
+```
+
 Copy grants from the old database to the new database:
 
 ```powershell
@@ -256,6 +308,20 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 Then run the script again.
 
+## Compressed dump behavior
+
+Use `-CompressDump` to store the dump as a gzip-compressed SQL file.
+
+With `-CompressDump`:
+
+- the default dump filename ends with `.sql.gz`;
+- the dump is compressed while it is being created;
+- the dump is decompressed automatically while it is being imported;
+- the Bash script requires `gzip`;
+- the PowerShell script uses .NET gzip streams and does not require an external compressor.
+
+This avoids keeping a large uncompressed `.sql` dump on disk.
+
 ## MySQL compatibility
 
 The scripts now support both MariaDB and MySQL.
@@ -297,7 +363,7 @@ The generated grants file is kept on disk by default so that you can inspect wha
 
 When `-DeleteSqlFiles` is used, the scripts delete generated SQL files only after the complete operation succeeds.
 
-The dump file is deleted after:
+The dump file, compressed or uncompressed, is deleted after:
 
 - the new database is created;
 - the dump is created;

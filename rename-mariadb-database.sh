@@ -10,9 +10,11 @@ DUMP_FILE=""
 GRANTS_FILE=""
 CLIENT_EXE=""
 DUMP_EXE=""
+GZIP_EXE=""
 DROP_OLD_DATABASE=false
 COPY_GRANTS=false
 DELETE_SQL_FILES=false
+COMPRESS_DUMP=false
 GRANTS_FILE_CREATED=false
 
 usage() {
@@ -28,7 +30,10 @@ Options:
   -User USER              MariaDB/MySQL user; default: root
   -Host HOST              MariaDB/MySQL host; default: localhost
   -Port PORT              MariaDB/MySQL port; default: 3306
-  -DumpFile PATH          SQL dump file to create; default: OLD_DB-YYYYMMDD-HHMMSS.sql
+  -DumpFile PATH          Dump file to create; default: OLD_DB-YYYYMMDD-HHMMSS.sql
+                          or OLD_DB-YYYYMMDD-HHMMSS.sql.gz with -CompressDump
+  -CompressDump           Store the dump as gzip-compressed SQL (.sql.gz)
+  -GzipExe PATH           Path to gzip; default: auto-detect when -CompressDump is used
   -CopyGrants             Copy database, table, and column-level grants to the new database
   -GrantsFile PATH        SQL grants file to create when -CopyGrants is used;
                           default: OLD_DB-to-NEW_DB-grants-YYYYMMDD-HHMMSS.sql
@@ -40,6 +45,19 @@ Options:
 
 Examples:
   ./rename-mariadb-database.sh -OldDb oldname -NewDb newname -User root
+
+  ./rename-mariadb-database.sh \
+    -OldDb oldname \
+    -NewDb newname \
+    -User root \
+    -CompressDump
+
+  ./rename-mariadb-database.sh \
+    -OldDb oldname \
+    -NewDb newname \
+    -User root \
+    -DumpFile /tmp/oldname.sql.gz \
+    -CompressDump
 
   ./rename-mariadb-database.sh \
     -OldDb oldname \
@@ -181,6 +199,15 @@ while [[ $# -gt 0 ]]; do
       DUMP_FILE="$2"
       shift 2
       ;;
+    -CompressDump)
+      COMPRESS_DUMP=true
+      shift
+      ;;
+    -GzipExe)
+      require_value "$1" "${2:-}"
+      GZIP_EXE="$2"
+      shift 2
+      ;;
     -CopyGrants)
       COPY_GRANTS=true
       shift
@@ -229,7 +256,13 @@ fi
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 
 if [[ -z "$DUMP_FILE" ]]; then
-  DUMP_FILE="${OLD_DB}-${TIMESTAMP}.sql"
+  if [[ "$COMPRESS_DUMP" == true ]]; then
+    DUMP_FILE="${OLD_DB}-${TIMESTAMP}.sql.gz"
+  else
+    DUMP_FILE="${OLD_DB}-${TIMESTAMP}.sql"
+  fi
+elif [[ "$COMPRESS_DUMP" == true && "$DUMP_FILE" != *.gz ]]; then
+  warn "-CompressDump is enabled but -DumpFile does not end with .gz"
 fi
 
 if [[ -z "$GRANTS_FILE" ]]; then
@@ -252,6 +285,16 @@ if [[ -z "$DUMP_EXE" ]]; then
 else
   DUMP_EXE_RESOLVED="$(resolve_executable "$DUMP_EXE")" || die "Could not find dump executable: $DUMP_EXE"
   DUMP_EXE="$DUMP_EXE_RESOLVED"
+fi
+
+if [[ "$COMPRESS_DUMP" == true ]]; then
+  if [[ -z "$GZIP_EXE" ]]; then
+    GZIP_EXE_RESOLVED="$(resolve_executable "gzip")" || die "Could not find gzip. Install gzip or use -GzipExe to specify it."
+    GZIP_EXE="$GZIP_EXE_RESOLVED"
+  else
+    GZIP_EXE_RESOLVED="$(resolve_executable "$GZIP_EXE")" || die "Could not find gzip executable: $GZIP_EXE"
+    GZIP_EXE="$GZIP_EXE_RESOLVED"
+  fi
 fi
 
 read -rsp "Database password for $DB_USER: " DB_PASS
@@ -379,16 +422,31 @@ SQL_COPY_GRANTS="$(replace_placeholder "$SQL_COPY_GRANTS" "__NEW_DB_IDENTIFIER_L
 echo "Creating database '$NEW_DB'..."
 "$CLIENT_EXE" "$DEFAULTS_ARG" -e "CREATE DATABASE $NEW_DB_QUOTED;"
 
-echo "Dumping '$OLD_DB' to '$DUMP_FILE'..."
-"$DUMP_EXE" "$DEFAULTS_ARG" \
-  --single-transaction \
-  --routines \
-  --triggers \
-  --events \
-  "$OLD_DB" > "$DUMP_FILE"
+if [[ "$COMPRESS_DUMP" == true ]]; then
+  echo "Dumping '$OLD_DB' to compressed dump '$DUMP_FILE'..."
+  "$DUMP_EXE" "$DEFAULTS_ARG" \
+    --single-transaction \
+    --routines \
+    --triggers \
+    --events \
+    "$OLD_DB" | "$GZIP_EXE" -c > "$DUMP_FILE"
+else
+  echo "Dumping '$OLD_DB' to '$DUMP_FILE'..."
+  "$DUMP_EXE" "$DEFAULTS_ARG" \
+    --single-transaction \
+    --routines \
+    --triggers \
+    --events \
+    "$OLD_DB" > "$DUMP_FILE"
+fi
 
-echo "Importing '$DUMP_FILE' into '$NEW_DB'..."
-"$CLIENT_EXE" "$DEFAULTS_ARG" "$NEW_DB" < "$DUMP_FILE"
+if [[ "$COMPRESS_DUMP" == true ]]; then
+  echo "Importing compressed dump '$DUMP_FILE' into '$NEW_DB'..."
+  "$GZIP_EXE" -dc "$DUMP_FILE" | "$CLIENT_EXE" "$DEFAULTS_ARG" "$NEW_DB"
+else
+  echo "Importing '$DUMP_FILE' into '$NEW_DB'..."
+  "$CLIENT_EXE" "$DEFAULTS_ARG" "$NEW_DB" < "$DUMP_FILE"
+fi
 
 echo "Comparing table counts..."
 "$CLIENT_EXE" "$DEFAULTS_ARG" -e "$SQL_TABLE_COUNT"

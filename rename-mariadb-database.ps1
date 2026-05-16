@@ -10,8 +10,9 @@
       2. Creates a temporary client option file.
       3. Creates the new database.
       4. Dumps the old database, including routines, triggers, and events.
-      5. Imports the dump into the new database.
-      6. Shows a simple table-count comparison.
+      5. Optionally stores the dump as a gzip-compressed SQL file.
+      6. Imports the dump into the new database.
+      7. Shows a simple table-count comparison.
       7. Optionally copies database, table, and column-level grants.
       8. Optionally deletes generated SQL files.
       9. Leaves the old database untouched unless you explicitly use -DropOldDatabase.
@@ -24,6 +25,9 @@
 
 .EXAMPLE
     .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root
+
+.EXAMPLE
+    .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root -CompressDump
 
 .EXAMPLE
     .\rename-mariadb-database.ps1 -OldDb oldname -NewDb newname -User root -CopyGrants
@@ -70,6 +74,8 @@ param(
     [int]$Port = 3306,
 
     [string]$DumpFile = "",
+
+    [switch]$CompressDump,
 
     [string]$GrantsFile = "",
 
@@ -249,6 +255,159 @@ function Invoke-NativeRedirectInputOutput {
 }
 
 
+
+function Join-CommandLineArguments {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $quotedArguments = foreach ($argument in $Arguments) {
+        if ($null -eq $argument -or $argument -eq "") {
+            '""'
+        }
+        elseif ($argument -notmatch '[\s"]') {
+            $argument
+        }
+        else {
+            $escaped = $argument -replace '(\\*)"', '$1$1\"'
+            $escaped = $escaped -replace '(\\+)$', '$1$1'
+            '"' + $escaped + '"'
+        }
+    }
+
+    return ($quotedArguments -join " ")
+}
+
+function Copy-Stream {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.Stream]$InputStream,
+
+        [Parameter(Mandatory = $true)]
+        [System.IO.Stream]$OutputStream
+    )
+
+    $buffer = New-Object byte[] 1048576
+
+    while (($bytesRead = $InputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $OutputStream.Write($buffer, 0, $bytesRead)
+    }
+}
+
+function Invoke-NativeCompressedOutput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Exe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$OutputFile
+    )
+
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $Exe
+    $processInfo.Arguments = Join-CommandLineArguments -Arguments $Arguments
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.RedirectStandardError = $false
+    $processInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+
+    $fileStream = $null
+    $gzipStream = $null
+
+    try {
+        $fileStream = [System.IO.File]::Create($OutputFile)
+        $gzipStream = New-Object System.IO.Compression.GZipStream -ArgumentList $fileStream, ([System.IO.Compression.CompressionMode]::Compress)
+
+        [void]$process.Start()
+        Copy-Stream -InputStream $process.StandardOutput.BaseStream -OutputStream $gzipStream
+
+        $gzipStream.Close()
+        $fileStream.Close()
+
+        $process.WaitForExit()
+
+        if ($process.ExitCode -ne 0) {
+            throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')"
+        }
+    }
+    finally {
+        if ($gzipStream) {
+            $gzipStream.Dispose()
+        }
+
+        if ($fileStream) {
+            $fileStream.Dispose()
+        }
+
+        if ($process) {
+            $process.Dispose()
+        }
+    }
+}
+
+function Invoke-NativeCompressedInput {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Exe,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$InputFile
+    )
+
+    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $processInfo.FileName = $Exe
+    $processInfo.Arguments = Join-CommandLineArguments -Arguments $Arguments
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardInput = $true
+    $processInfo.RedirectStandardError = $false
+    $processInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $processInfo
+
+    $fileStream = $null
+    $gzipStream = $null
+
+    try {
+        [void]$process.Start()
+
+        $fileStream = [System.IO.File]::OpenRead($InputFile)
+        $gzipStream = New-Object System.IO.Compression.GZipStream -ArgumentList $fileStream, ([System.IO.Compression.CompressionMode]::Decompress)
+
+        Copy-Stream -InputStream $gzipStream -OutputStream $process.StandardInput.BaseStream
+        $process.StandardInput.Close()
+
+        $process.WaitForExit()
+
+        if ($process.ExitCode -ne 0) {
+            throw "Command failed with exit code $($process.ExitCode): $Exe $($Arguments -join ' ')"
+        }
+    }
+    finally {
+        if ($gzipStream) {
+            $gzipStream.Dispose()
+        }
+
+        if ($fileStream) {
+            $fileStream.Dispose()
+        }
+
+        if ($process) {
+            $process.Dispose()
+        }
+    }
+}
+
 function Protect-TempFileBestEffort {
     param(
         [Parameter(Mandatory = $true)]
@@ -314,7 +473,15 @@ else {
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 if ([string]::IsNullOrWhiteSpace($DumpFile)) {
-    $DumpFile = Join-Path (Get-Location) "$OldDb-$timestamp.sql"
+    if ($CompressDump) {
+        $DumpFile = Join-Path (Get-Location) "$OldDb-$timestamp.sql.gz"
+    }
+    else {
+        $DumpFile = Join-Path (Get-Location) "$OldDb-$timestamp.sql"
+    }
+}
+elseif ($CompressDump -and -not $DumpFile.EndsWith(".gz", [System.StringComparison]::OrdinalIgnoreCase)) {
+    Write-Warning "-CompressDump is enabled but -DumpFile does not end with .gz"
 }
 
 if ([string]::IsNullOrWhiteSpace($GrantsFile)) {
@@ -453,21 +620,43 @@ port=$Port
         "CREATE DATABASE $NewDbQuoted;"
     )
 
-    Write-Host "Dumping '$OldDb' to '$DumpFile'..."
-    Invoke-NativeRedirectOutput -Exe $DumpExe -Arguments @(
-        $defaultsArg,
-        "--single-transaction",
-        "--routines",
-        "--triggers",
-        "--events",
-        $OldDb
-    ) -OutputFile $DumpFile
+    if ($CompressDump) {
+        Write-Host "Dumping '$OldDb' to compressed dump '$DumpFile'..."
+        Invoke-NativeCompressedOutput -Exe $DumpExe -Arguments @(
+            $defaultsArg,
+            "--single-transaction",
+            "--routines",
+            "--triggers",
+            "--events",
+            $OldDb
+        ) -OutputFile $DumpFile
+    }
+    else {
+        Write-Host "Dumping '$OldDb' to '$DumpFile'..."
+        Invoke-NativeRedirectOutput -Exe $DumpExe -Arguments @(
+            $defaultsArg,
+            "--single-transaction",
+            "--routines",
+            "--triggers",
+            "--events",
+            $OldDb
+        ) -OutputFile $DumpFile
+    }
 
-    Write-Host "Importing '$DumpFile' into '$NewDb'..."
-    Invoke-NativeRedirectInput -Exe $ClientExe -Arguments @(
-        $defaultsArg,
-        $NewDb
-    ) -InputFile $DumpFile
+    if ($CompressDump) {
+        Write-Host "Importing compressed dump '$DumpFile' into '$NewDb'..."
+        Invoke-NativeCompressedInput -Exe $ClientExe -Arguments @(
+            $defaultsArg,
+            $NewDb
+        ) -InputFile $DumpFile
+    }
+    else {
+        Write-Host "Importing '$DumpFile' into '$NewDb'..."
+        Invoke-NativeRedirectInput -Exe $ClientExe -Arguments @(
+            $defaultsArg,
+            $NewDb
+        ) -InputFile $DumpFile
+    }
 
     Write-Host "Comparing table counts..."
     Invoke-Native -Exe $ClientExe -Arguments @(
